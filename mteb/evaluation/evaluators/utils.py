@@ -10,6 +10,67 @@ import tqdm
 from packaging.version import Version
 from sklearn.metrics import auc
 
+def tensor_transform(x):
+    
+    # linearly tranforms the input vector to range [0, c], followed by L1 normalization for "probability distribution"
+
+    # c is upper limit of [0, c], can be treated as a hyperparameter
+    c=1
+    x_min = x.min(dim=1, keepdim=True).values
+    x_shifted = x - x_min
+
+    x_max = x_shifted.max(dim=1, keepdim = True).values
+    eps = 1e-6
+    # to avoid division by 0
+    scale = torch.where(x_max==0, eps * torch.ones_like(x_max), x_max)
+    # x_scaled = x_shifted/x_max
+    x_scaled = x_shifted/scale
+    x_scaled_to_c = x_scaled*c
+
+    x_sum = x_scaled_to_c.sum(dim=1, keepdim=True)
+    # uniform distribution if sum is 0
+    x_sum_normalized = torch.where(x_sum == 0, torch.ones_like(x_scaled) / x_scaled_to_c.size(1), x_scaled_to_c/x_sum)
+    return x_sum_normalized
+
+
+
+def js_div(a, b):
+    """
+    Compute Jensen-Shannon divergence between probability distributions.
+
+    Args:
+        a (Tensor): Batch of distributions shape [B, D]
+        b (Tensor): Batch of distributions shape [C, D]
+
+    Returns:
+        Tensor: JS divergence scores shape [B, C]
+    """
+    if not isinstance(a, torch.Tensor):
+        a = torch.tensor(a)
+
+    if not isinstance(b, torch.Tensor):
+        b = torch.tensor(b)
+
+    # for scaling and normalization of input
+    a = tensor_transform(a)
+    b = tensor_transform(b)
+    
+    # Expand for broadcast and pairwise calculation between each query and doc
+    a = a.unsqueeze(1)  # [B, 1, D]
+    b = b.unsqueeze(0)  # [1, C, D]
+    
+    eps=1e-5
+    a = torch.clamp(a, min=eps, max=1.0-eps)
+    b = torch.clamp(b, min=eps, max=1.0-eps)
+    m = 0.5 * (a + b) + eps
+    # log2 to keep values within range [0, 1]
+    kl_am = torch.sum(a * torch.log2(a / m), dim=-1)
+    kl_bm = torch.sum(b * torch.log2(b / m), dim=-1)
+    
+    # Compute JS divergence and convert to similarity to match scale of standard similarities
+    js_similarity = 1.0 - 0.5 * (kl_am + kl_bm)
+    
+    return js_similarity
 
 def cos_sim(a, b):
     """Computes the cosine similarity cos_sim(a[i], b[j]) for all i and j.
