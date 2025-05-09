@@ -23,6 +23,7 @@ from .utils import (
     convert_conv_history_to_query,
     cos_sim,
     download,
+    js_div,
     hole,
     mrr,
     nAUC,
@@ -172,7 +173,7 @@ class DenseRetrievalExactSearch:
                     query_embeddings, sub_corpus_embeddings
                 )
             else:
-                similarity_scores = cos_sim(query_embeddings, sub_corpus_embeddings)
+                similarity_scores = js_div(query_embeddings, sub_corpus_embeddings)
             is_nan = torch.isnan(similarity_scores)
             if is_nan.sum() > 0:
                 logger.warning(
