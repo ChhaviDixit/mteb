@@ -1,489 +1,477 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
+from functools import partial
+from typing import Any
 
 import numpy as np
-import pandas as pd
-import requests
 import torch
-import tqdm
-from packaging.version import Version
-from sklearn.metrics import auc
-
-def tensor_transform(x):
-    
-    # linearly tranforms the input vector to range [0, c], followed by L1 normalization for "probability distribution"
-
-    # c is upper limit of [0, c], can be treated as a hyperparameter
-    c=1
-    x_min = x.min(dim=1, keepdim=True).values
-    x_shifted = x - x_min
-
-    x_max = x_shifted.max(dim=1, keepdim = True).values
-    eps = 1e-6
-    # to avoid division by 0
-    scale = torch.where(x_max==0, eps * torch.ones_like(x_max), x_max)
-    # x_scaled = x_shifted/x_max
-    x_scaled = x_shifted/scale
-    x_scaled_to_c = x_scaled*c
-
-    x_sum = x_scaled_to_c.sum(dim=1, keepdim=True)
-    # uniform distribution if sum is 0
-    x_sum_normalized = torch.where(x_sum == 0, torch.ones_like(x_scaled) / x_scaled_to_c.size(1), x_scaled_to_c/x_sum)
-    return x_sum_normalized
-
-
-
-def js_div(a, b):
-    """
-    Compute Jensen-Shannon divergence between probability distributions.
-
-    Args:
-        a (Tensor): Batch of distributions shape [B, D]
-        b (Tensor): Batch of distributions shape [C, D]
-
-    Returns:
-        Tensor: JS divergence scores shape [B, C]
-    """
-    if not isinstance(a, torch.Tensor):
-        a = torch.tensor(a)
-
-    if not isinstance(b, torch.Tensor):
-        b = torch.tensor(b)
-
-    # for scaling and normalization of input
-    a = tensor_transform(a)
-    b = tensor_transform(b)
-    
-    # Expand for broadcast and pairwise calculation between each query and doc
-    a = a.unsqueeze(1)  # [B, 1, D]
-    b = b.unsqueeze(0)  # [1, C, D]
-    
-    eps=1e-5
-    a = torch.clamp(a, min=eps, max=1.0-eps)
-    b = torch.clamp(b, min=eps, max=1.0-eps)
-    m = 0.5 * (a + b) + eps
-    # log2 to keep values within range [0, 1]
-    kl_am = torch.sum(a * torch.log2(a / m), dim=-1)
-    kl_bm = torch.sum(b * torch.log2(b / m), dim=-1)
-    
-    # Compute JS divergence and convert to similarity to match scale of standard similarities
-    js_similarity = 1.0 - 0.5 * (kl_am + kl_bm)
-    
-    return js_similarity
-
-def cos_sim(a, b):
-    """Computes the cosine similarity cos_sim(a[i], b[j]) for all i and j.
-
-    Return:
-        Matrix with res[i][j]  = cos_sim(a[i], b[j])
-    """  # noqa: D402
-    if not isinstance(a, torch.Tensor):
-        a = torch.tensor(a)
-
-    if not isinstance(b, torch.Tensor):
-        b = torch.tensor(b)
-
-    if len(a.shape) == 1:
-        a = a.unsqueeze(0)
-
-    if len(b.shape) == 1:
-        b = b.unsqueeze(0)
-
-    a_norm = torch.nn.functional.normalize(a, p=2, dim=1)
-    b_norm = torch.nn.functional.normalize(b, p=2, dim=1)
-    return torch.mm(a_norm, b_norm.transpose(0, 1))
-
-
-def dot_score(a: torch.Tensor, b: torch.Tensor):
-    """Computes the dot-product dot_prod(a[i], b[j]) for all i and j.
-    :return: Matrix with res[i][j]  = dot_prod(a[i], b[j])
-    """
-    if not isinstance(a, torch.Tensor):
-        a = torch.tensor(a)
-
-    if not isinstance(b, torch.Tensor):
-        b = torch.tensor(b)
-
-    if len(a.shape) == 1:
-        a = a.unsqueeze(0)
-
-    if len(b.shape) == 1:
-        b = b.unsqueeze(0)
-
-    return torch.mm(a, b.transpose(0, 1))
-
-
-# From https://github.com/beir-cellar/beir/blob/f062f038c4bfd19a8ca942a9910b1e0d218759d4/beir/retrieval/custom_metrics.py#L4
-def mrr(
-    qrels: dict[str, dict[str, int]],
-    results: dict[str, dict[str, float]],
-    k_values: list[int],
-    output_type: str = "mean",
-) -> tuple[dict[str, float]]:
-    MRR = {}
-
-    for k in k_values:
-        MRR[f"MRR@{k}"] = []
-
-    k_max, top_hits = max(k_values), {}
-    logging.info("\n")
-
-    for query_id, doc_scores in results.items():
-        top_hits[query_id] = sorted(
-            doc_scores.items(), key=lambda item: item[1], reverse=True
-        )[0:k_max]
-
-    for query_id in top_hits:
-        query_relevant_docs = {
-            doc_id for doc_id in qrels[query_id] if qrels[query_id][doc_id] > 0
-        }
-        for k in k_values:
-            rr = 0
-            for rank, hit in enumerate(top_hits[query_id][0:k]):
-                if hit[0] in query_relevant_docs:
-                    rr = 1.0 / (rank + 1)
-                    break
-            MRR[f"MRR@{k}"].append(rr)
-
-    if output_type == "mean":
-        for k in k_values:
-            MRR[f"MRR@{k}"] = round(sum(MRR[f"MRR@{k}"]) / len(qrels), 5)
-            logging.info("MRR@{}: {:.4f}".format(k, MRR[f"MRR@{k}"]))
-
-    elif output_type == "all":
-        pass
-
-    return MRR
-
-
-def recall_cap(
-    qrels: dict[str, dict[str, int]],
-    results: dict[str, dict[str, float]],
-    k_values: list[int],
-    output_type: str = "mean",
-) -> tuple[dict[str, float]]:
-    capped_recall = {}
-
-    for k in k_values:
-        capped_recall[f"R_cap@{k}"] = []
-
-    k_max = max(k_values)
-    logging.info("\n")
-
-    for query_id, doc_scores in results.items():
-        top_hits = sorted(doc_scores.items(), key=lambda item: item[1], reverse=True)[
-            0:k_max
-        ]
-        query_relevant_docs = [
-            doc_id for doc_id in qrels[query_id] if qrels[query_id][doc_id] > 0
-        ]
-        for k in k_values:
-            retrieved_docs = [
-                row[0] for row in top_hits[0:k] if qrels[query_id].get(row[0], 0) > 0
-            ]
-            denominator = min(len(query_relevant_docs), k)
-            capped_recall[f"R_cap@{k}"].append(len(retrieved_docs) / denominator)
-
-    if output_type == "mean":
-        for k in k_values:
-            capped_recall[f"R_cap@{k}"] = round(
-                sum(capped_recall[f"R_cap@{k}"]) / len(qrels), 5
-            )
-            logging.info("R_cap@{}: {:.4f}".format(k, capped_recall[f"R_cap@{k}"]))
-
-    elif output_type == "all":
-        pass
-
-    return capped_recall
-
-
-def hole(
-    qrels: dict[str, dict[str, int]],
-    results: dict[str, dict[str, float]],
-    k_values: list[int],
-    output_type: str = "mean",
-) -> tuple[dict[str, float]]:
-    Hole = {}
-
-    for k in k_values:
-        Hole[f"Hole@{k}"] = []
-
-    annotated_corpus = set()
-    for _, docs in qrels.items():
-        for doc_id, score in docs.items():
-            annotated_corpus.add(doc_id)
-
-    k_max = max(k_values)
-    logging.info("\n")
-
-    for _, scores in results.items():
-        top_hits = sorted(scores.items(), key=lambda item: item[1], reverse=True)[
-            0:k_max
-        ]
-        for k in k_values:
-            hole_docs = [
-                row[0] for row in top_hits[0:k] if row[0] not in annotated_corpus
-            ]
-            Hole[f"Hole@{k}"].append(len(hole_docs) / k)
-
-    if output_type == "mean":
-        for k in k_values:
-            Hole[f"Hole@{k}"] = round(Hole[f"Hole@{k}"] / len(qrels), 5)
-            logging.info("Hole@{}: {:.4f}".format(k, Hole[f"Hole@{k}"]))
-
-    elif output_type == "all":
-        pass
-
-    return Hole
-
-
-def top_k_accuracy(
-    qrels: dict[str, dict[str, int]],
-    results: dict[str, dict[str, float]],
-    k_values: list[int],
-    output_type: str = "mean",
-) -> dict[str, float]:
-    top_k_acc = {}
-
-    for k in k_values:
-        top_k_acc[f"Accuracy@{k}"] = []
-
-    k_max, top_hits = max(k_values), {}
-    logging.info("\n")
-
-    for query_id, doc_scores in results.items():
-        top_hits[query_id] = [
-            item[0]
-            for item in sorted(
-                doc_scores.items(), key=lambda item: item[1], reverse=True
-            )[0:k_max]
-        ]
-
-    for query_id in top_hits:
-        query_relevant_docs = {
-            doc_id for doc_id in qrels[query_id] if qrels[query_id][doc_id] > 0
-        }
-        for k in k_values:
-            for relevant_doc_id in query_relevant_docs:
-                if relevant_doc_id in top_hits[query_id][0:k]:
-                    top_k_acc[f"Accuracy@{k}"].append(1.0)
-                    break
-
-    if output_type == "mean":
-        for k in k_values:
-            top_k_acc[f"Accuracy@{k}"] = round(
-                top_k_acc[f"Accuracy@{k}"] / len(qrels), 5
-            )
-            logging.info("Accuracy@{}: {:.4f}".format(k, top_k_acc[f"Accuracy@{k}"]))
-
-    elif output_type == "all":
-        pass
-
-    return top_k_acc
-
-
-def get_rank_from_dict(
-    dict_of_results: dict[str, float], doc_id: str
-) -> tuple[int, float]:
-    tuple_of_id_score = dict_of_results.items()
-    sorted_by_score = sorted(tuple_of_id_score, key=lambda x: x[1], reverse=True)
-    for i, (id, score) in enumerate(sorted_by_score):
-        if id == doc_id:
-            return i + 1, score
-
-    return len(sorted_by_score) + 1, 0
-
-
-def evaluate_change(
-    original_run: dict[str, dict[str, float]],
-    new_run: dict[str, dict[str, float]],
-    changed_qrels: dict[str, list[str]],
-) -> dict[str, float]:
-    changes = []
-    for qid in changed_qrels.keys():
-        original_qid_run = original_run[qid]
-        new_qid_run = new_run[qid]
-        for idx, changed_doc in enumerate(changed_qrels[qid]):
-            original_rank, original_score = get_rank_from_dict(
-                original_qid_run, changed_doc
-            )
-            new_rank, new_score = get_rank_from_dict(new_qid_run, changed_doc)
-            change = int(original_rank - new_rank)
-            changes.append(
-                {
-                    "qid": qid,
-                    "doc_id": changed_doc,
-                    "change": change,
-                    "relevance": 0,
-                    "og_rank": original_rank,
-                    "new_rank": new_rank,
-                    "og_score": original_score,
-                    "new_score": new_score,
-                }
-            )
-
-    # we now have a DF of [qid, doc_id, change] to run our calculations with
-    changes_df = pd.DataFrame(changes)
-    changes_df["p-MRR"] = changes_df.apply(lambda x: rank_score(x), axis=1)
-    qid_wise = changes_df.groupby("qid").agg({"p-MRR": "mean"})
-    return {
-        "p-MRR": qid_wise["p-MRR"].mean(),
+from sentence_transformers import __version__ as st_version
+
+from mteb.encoder_interface import PromptType
+from mteb.model_meta import ModelMeta
+from mteb.models.sentence_transformer_wrapper import SentenceTransformerWrapper
+from mteb.requires_package import requires_package
+
+logger = logging.getLogger(__name__)
+
+MIN_SENTENCE_TRANSFORMERS_VERSION = (3, 1, 0)
+
+# change to work with latest dev version of sentence-transformer (4.2.0.dev0 )
+version_parts = []
+for part in st_version.split("."):
+    if part.isdigit():
+        version_parts.append(int(part))
+    else:
+        break  # Stop at first non-numeric part (e.g., "dev0")
+CURRENT_SENTENCE_TRANSFORMERS_VERSION = tuple(version_parts)
+# CURRENT_SENTENCE_TRANSFORMERS_VERSION = tuple(map(int, st_version.split(".")))
+
+XLMR_LANGUAGES = [
+    "afr-Latn",
+    "amh-Latn",
+    "ara-Latn",
+    "asm-Latn",
+    "aze-Latn",
+    "bel-Latn",
+    "bul-Latn",
+    "ben-Latn",
+    "ben-Beng",
+    "bre-Latn",
+    "bos-Latn",
+    "cat-Latn",
+    "ces-Latn",
+    "cym-Latn",
+    "dan-Latn",
+    "deu-Latn",
+    "ell-Latn",
+    "eng-Latn",
+    "epo-Latn",
+    "spa-Latn",
+    "est-Latn",
+    "eus-Latn",
+    "fas-Latn",
+    "fin-Latn",
+    "fra-Latn",
+    "fry-Latn",
+    "gle-Latn",
+    "gla-Latn",
+    "glg-Latn",
+    "guj-Latn",
+    "hau-Latn",
+    "heb-Latn",
+    "hin-Latn",
+    "hin-Deva",
+    "hrv-Latn",
+    "hun-Latn",
+    "hye-Latn",
+    "ind-Latn",
+    "isl-Latn",
+    "ita-Latn",
+    "jpn-Latn",
+    "jav-Latn",
+    "kat-Latn",
+    "kaz-Latn",
+    "khm-Latn",
+    "kan-Latn",
+    "kor-Latn",
+    "kur-Latn",
+    "kir-Latn",
+    "lat-Latn",
+    "lao-Latn",
+    "lit-Latn",
+    "lav-Latn",
+    "mlg-Latn",
+    "mkd-Latn",
+    "mal-Latn",
+    "mon-Latn",
+    "mar-Latn",
+    "msa-Latn",
+    "mya-Latn",
+    "nep-Latn",
+    "nld-Latn",
+    "nob-Latn",
+    "orm-Latn",
+    "ori-Latn",
+    "pan-Latn",
+    "pol-Latn",
+    "pus-Latn",
+    "por-Latn",
+    "ron-Latn",
+    "rus-Latn",
+    "san-Latn",
+    "snd-Latn",
+    "sin-Latn",
+    "slk-Latn",
+    "slv-Latn",
+    "som-Latn",
+    "sqi-Latn",
+    "srp-Latn",
+    "sun-Latn",
+    "swe-Latn",
+    "swa-Latn",
+    "tam-Latn",
+    "tam-Taml",
+    "tel-Latn",
+    "tel-Telu",
+    "tha-Latn",
+    "tgl-Latn",
+    "tur-Latn",
+    "uig-Latn",
+    "ukr-Latn",
+    "urd-Latn",
+    "urd-Arab",
+    "uzb-Latn",
+    "vie-Latn",
+    "xho-Latn",
+    "yid-Latn",
+    "zho-Hant",
+    "zho-Hans",
+]
+
+
+class JinaWrapper(SentenceTransformerWrapper):
+    """following the hf model card documentation."""
+
+    jina_task_to_prompt = {
+        "retrieval.query": "Represent the query for retrieving evidence documents: ",
+        "retrieval.passage": "Represent the document for retrieval: ",
     }
 
-
-def rank_score(x: dict[str, float]) -> float:
-    if x["og_rank"] >= x["new_rank"]:
-        return ((1 / x["og_rank"]) / (1 / x["new_rank"])) - 1
-    else:
-        return 1 - ((1 / x["new_rank"]) / (1 / x["og_rank"]))
-
-
-# https://stackoverflow.com/a/62113293
-def download(url: str, fname: str):
-    resp = requests.get(url, stream=True)
-    total = int(resp.headers.get("content-length", 0))
-    with (
-        open(fname, "wb") as file,
-        tqdm.tqdm(
-            desc=fname,
-            total=total,
-            unit="iB",
-            unit_scale=True,
-            unit_divisor=1024,
-        ) as bar,
-    ):
-        for data in resp.iter_content(chunk_size=1024):
-            size = file.write(data)
-            bar.update(size)
-
-
-def convert_conv_history_to_query(conversations: list[list[str | dict]]) -> str:
-    conversations_converted = []
-
-    for conversation in conversations:
-        # if it's a list of strings, just join them
-        if isinstance(conversation[0], str):
-            conv_str = "; ".join(conversation)
-        # otherwise, it's a list of dictionaries, which we need to convert to strings
-        elif isinstance(conversation[0], dict):
-            conv = []
-            for i, turn in enumerate(conversation):
-                error_msg = (
-                    "When converting conversations lists of dictionary to string, each turn in the conversation "
-                    + "must be a dictionary with 'role' and 'content' keys"
-                )
-                if not isinstance(turn, dict):
-                    raise ValueError(f"Turn {i} is not a dictionary. " + error_msg)
-
-                # check for keys 'role' and 'content' in the dictionary, if not found, raise an error
-                if "role" not in turn:
-                    raise ValueError(
-                        "Key 'role' not found in the dictionary. " + error_msg
-                    )
-                if "content" not in turn:
-                    raise ValueError(
-                        "Key 'content' not found in the dictionary. " + error_msg
-                    )
-
-                conv.append(f"{turn['role']}: {turn['content']}")
-            conv_str = "; ".join(conv)
-        else:
-            raise ValueError(
-                "Conversations must be a list consisting of strings or dictionaries with 'role' and 'content' keys"
+    def __init__(
+        self,
+        model: str,
+        revision: str | None = None,
+        model_prompts: dict[str, str] | None = None,
+        **kwargs,
+    ) -> None:
+        if CURRENT_SENTENCE_TRANSFORMERS_VERSION < MIN_SENTENCE_TRANSFORMERS_VERSION:
+            raise RuntimeError(
+                f"sentence_transformers version {st_version} is lower than the required version 3.1.0"
             )
+        requires_package(self, "einops", model, "pip install 'mteb[jina]'")
+        import einops  # noqa: F401
 
-        conversations_converted.append(conv_str)
+        requires_package(
+            self, "flash_attn", model, "pip install 'mteb[flash_attention]'"
+        )
+        import flash_attn  # noqa: F401
 
-    return conversations_converted
+        super().__init__(model, revision, model_prompts, **kwargs)
 
-
-def confidence_scores(sim_scores: list[float]) -> dict[str, float]:
-    """Computes confidence scores for a single instance = (query, positives, negatives)
-
-    Args:
-        sim_scores: Query-documents similarity scores with length `num_pos+num_neg`
-
-    Returns:
-        conf_scores:
-            - `max`: Maximum similarity score
-            - `std`: Standard deviation of similarity scores
-            - `diff1`: Difference between highest and second highest similarity scores
-    """
-    sim_scores_sorted = sorted(sim_scores)[::-1]
-
-    cs_max = sim_scores_sorted[0]
-    cs_std = np.std(sim_scores)
-    if len(sim_scores) > 1:
-        cs_diff1 = sim_scores_sorted[0] - sim_scores_sorted[1]
-    elif len(sim_scores) == 1:
-        cs_diff1 = 0.0
-
-    conf_scores = {"max": cs_max, "std": cs_std, "diff1": cs_diff1}
-
-    return conf_scores
-
-
-def nAUC(
-    conf_scores: np.ndarray,
-    metrics: np.ndarray,
-    abstention_rates: np.ndarray = np.linspace(0, 1, 11)[:-1],
-) -> float:
-    """Computes normalized Area Under the Curve on a set of evaluated instances as presented in the paper https://arxiv.org/abs/2402.12997
-    1/ Computes the raw abstention curve, i.e., the average evaluation metric at different abstention rates determined by the confidence scores
-    2/ Computes the oracle abstention curve, i.e., the best theoretical abstention curve (e.g.: at a 10% abstention rate, the oracle abstains on the bottom-10% instances with regard to the evaluation metric)
-    3/ Computes the flat abstention curve, i.e., the one remains flat for all abstention rates (ineffective abstention)
-    4/ Computes the area under the three curves
-    5/ Finally scales the raw AUC between the oracle and the flat AUCs to get normalized AUC
-
-    Args:
-        conf_scores: Instance confidence scores used for abstention thresholding, with shape `(num_test_instances,)`
-        metrics: Metric evaluations at instance-level (e.g.: average precision, NDCG...), with shape `(num_test_instances,)`
-        abstention_rates: Target rates for the computation of the abstention curve
-
-    Returns:
-        abst_nauc: Normalized area under the abstention curve (upper-bounded by 1)
-    """
-
-    def abstention_curve(
-        conf_scores: np.ndarray,
-        metrics: np.ndarray,
-        abstention_rates: np.ndarray = np.linspace(0, 1, 11)[:-1],
+    def encode(
+        self,
+        sentences: Sequence[str],
+        *,
+        task_name: str,
+        prompt_type: PromptType | None = None,
+        **kwargs: Any,
     ) -> np.ndarray:
-        """Computes the raw abstention curve for a given set of evaluated instances and corresponding confidence scores
-
-        Args:
-            conf_scores: Instance confidence scores used for abstention thresholding, with shape `(num_test_instances,)`
-            metrics: Metric evaluations at instance-level (e.g.: average precision, NDCG...), with shape `(num_test_instances,)`
-            abstention_rates: Target rates for the computation of the abstention curve
-
-        Returns:
-            abst_curve: Abstention curve of length `len(abstention_rates)`
-        """
-        # argsort stable=True is default in numpy >2.0.0
-        if Version(np.__version__) < Version("2.0.0"):
-            conf_scores_argsort = np.argsort(conf_scores)
-        else:
-            conf_scores_argsort = np.argsort(conf_scores, stable=True)
-        abst_curve = np.zeros(len(abstention_rates))
-
-        for i, rate in enumerate(abstention_rates):
-            num_instances_abst = min(
-                round(rate * len(conf_scores_argsort)), len(conf_scores) - 1
+        prompt_name = self.get_prompt_name(self.model_prompts, task_name, prompt_type)
+        if prompt_name:
+            logger.info(
+                f"Using prompt_name={prompt_name} for task={task_name} prompt_type={prompt_type}"
             )
-            abst_curve[i] = metrics[conf_scores_argsort[num_instances_abst:]].mean()
+        else:
+            logger.info(
+                f"No model prompts found for task={task_name} prompt_type={prompt_type}"
+            )
+        logger.info(f"Encoding {len(sentences)} sentences.")
 
-        return abst_curve
+        jina_task_name = self.model_prompts.get(prompt_name, None)
 
-    abst_curve = abstention_curve(conf_scores, metrics, abstention_rates)
-    or_curve = abstention_curve(metrics, metrics, abstention_rates)
-    abst_auc = auc(abstention_rates, abst_curve)
-    or_auc = auc(abstention_rates, or_curve)
-    flat_auc = or_curve[0] * (abstention_rates[-1] - abstention_rates[0])
+        embeddings = self.model.encode(
+            sentences,
+            task=jina_task_name,
+            prompt=self.jina_task_to_prompt.get(jina_task_name, None),
+            **kwargs,
+        )
 
-    if or_auc == flat_auc:
-        abst_nauc = np.nan
-    else:
-        abst_nauc = (abst_auc - flat_auc) / (or_auc - flat_auc)
+        if isinstance(embeddings, torch.Tensor):
+            # sometimes in kwargs can be return_tensors=True
+            embeddings = embeddings.cpu().detach().float().numpy()
+        return embeddings
 
-    return abst_nauc
+
+jina_embeddings_v3 = ModelMeta(
+    loader=partial(  # type: ignore
+        JinaWrapper,
+        model="jinaai/jina-embeddings-v3",
+        revision="215a6e121fa0183376388ac6b1ae230326bfeaed",
+        trust_remote_code=True,
+        model_prompts={
+            "Retrieval-query": "retrieval.query",
+            "Retrieval-passage": "retrieval.passage",
+            "Clustering": "separation",
+            "Classification": "classification",
+            "STS": "text-matching",
+            "PairClassification": "classification",
+            "BitextMining": "text-matching",
+            "MultilabelClassification": "classification",
+            "Reranking": "separation",
+            "Summarization": "text-matching",
+        },
+    ),
+    name="jinaai/jina-embeddings-v3",
+    languages=XLMR_LANGUAGES,
+    open_weights=True,
+    revision="215a6e121fa0183376388ac6b1ae230326bfeaed",
+    release_date="2024-09-18",  # official release date
+    n_parameters=int(572 * 1e6),
+    memory_usage_mb=1092,
+    max_tokens=8194,
+    embed_dim=1024,
+    license="cc-by-nc-4.0",
+    similarity_fn_name="cosine",
+    framework=["Sentence Transformers", "PyTorch"],
+    use_instructions=True,
+    reference="https://huggingface.co/jinaai/jina-embeddings-v3",
+    public_training_code=None,
+    public_training_data=None,
+    training_datasets={
+        # CulturaX
+        "STS12": [],
+        # "SICK": [],
+        # "WMT19": [],
+        # "MADLAD-3B": [],
+        # NLI
+        "MSMARCO": ["train"],
+        "MSMARCOHardNegatives": ["train"],
+        "NanoMSMARCORetrieval": ["train"],
+        "mMARCO-NL": ["train"],  # translation not trained on
+        "NQ": ["train"],
+        "NQHardNegatives": ["train"],
+        "NanoNQRetrieval": ["train"],
+        "NQ-PL": ["train"],  # translation not trained on
+        "NQ-NL": ["train"],  # translation not trained on
+        # oasst1, oasst2
+    },
+    adapted_from="XLM-RoBERTa",
+)
+
+jina_embeddings_v2_base_en = ModelMeta(
+    loader=partial(
+        SentenceTransformerWrapper,
+        model_name="jinaai/jina-embeddings-v2-base-en",
+        revision="6e85f575bc273f1fd840a658067d0157933c83f0",
+        trust_remote_code=True,
+    ),
+    name="jinaai/jina-embeddings-v2-base-en",
+    languages=["eng-Latn"],
+    open_weights=True,
+    revision="6e85f575bc273f1fd840a658067d0157933c83f0",
+    release_date="2023-09-27",
+    n_parameters=137_000_000,
+    memory_usage_mb=262,
+    embed_dim=768,
+    license="apache-2.0",
+    max_tokens=8192,
+    reference="https://huggingface.co/jinaai/jina-embeddings-v2-base-en",
+    similarity_fn_name="cosine",
+    framework=["Sentence Transformers", "PyTorch"],
+    use_instructions=False,
+    superseded_by=None,
+    adapted_from="jina-bert-base-en-v1",  # pretrained on C4 with Alibi to support longer context.
+    training_datasets={
+        "PAQ": ["train"],
+        "GooAQ": ["train"],
+        "WikiAnswers": ["train"],
+        "AmazonQA": ["train"],
+        "ELI5": ["train"],
+        "SentenceCompression": ["train"],
+        "SimpleWikipedia": ["train"],
+        "Specter": ["train"],
+        "Squad2": ["train"],
+        "Tmdb": ["train"],
+        "TrivialQA": ["train"],
+        "TweetQA": ["train"],
+        "WikiHow": ["train"],
+        "Xmarket": [],  # adopted from Cross-Market Recommendation (XMRec).
+        "S2ORC": [],  # title abstract pair.
+        "YahooAnswers": [],  # question answer pair.
+        "MSMARCO": ["train"],  # pairs and mined hard negative.
+        "StackExchange": [],  # title body pair.
+        "QuoraQA": ["train"],  # duplicate question pairs.
+        "MsCocoCaptions": ["train"],  # pairs describe the same image.
+        "Flickr30k": ["train"],  # pairs describe the same image.
+        "SNLI": ["train"],  # random negative.
+        "ESCI": ["train"],  # exact match as positive match and mined hard negative.
+        "NegationDataset": [
+            "train"
+        ],  # synthetically generated negation dataset https://huggingface.co/datasets/jinaai/negation-dataset
+        "NQ": ["train"],  # mined hard negative.
+        "HotpotQA": ["train"],  # mined hard negative.
+        "FEVER": ["train"],  # mined hard negative.
+        "CC-NEWS": [],  # title-content with random negative.
+    },
+    public_training_code=None,
+    public_training_data=None,
+)
+
+jina_embeddings_v2_small_en = ModelMeta(
+    loader=partial(
+        SentenceTransformerWrapper,
+        model_name="jinaai/jina-embeddings-v2-small-en",
+        revision="44e7d1d6caec8c883c2d4b207588504d519788d0",
+        trust_remote_code=True,
+    ),
+    name="jinaai/jina-embeddings-v2-small-en",
+    languages=["eng-Latn"],
+    open_weights=True,
+    revision="44e7d1d6caec8c883c2d4b207588504d519788d0",
+    release_date="2023-09-27",
+    n_parameters=32_700_000,
+    memory_usage_mb=62,
+    embed_dim=512,
+    license="apache-2.0",
+    max_tokens=8192,
+    reference="https://huggingface.co/jinaai/jina-embeddings-v2-small-en",
+    similarity_fn_name="cosine",
+    framework=["Sentence Transformers", "PyTorch"],
+    use_instructions=False,
+    superseded_by=None,
+    adapted_from="jina-bert-smalll-en-v1",  # pretrained on C4 with Alibi to support longer context
+    training_datasets={
+        "PAQ": ["train"],
+        "GooAQ": ["train"],
+        "WikiAnswers": ["train"],
+        "AmazonQA": ["train"],
+        "ELI5": ["train"],
+        "SentenceCompression": ["train"],
+        "SimpleWikipedia": ["train"],
+        "Specter": ["train"],
+        "Squad2": ["train"],
+        "Tmdb": ["train"],
+        "TrivialQA": ["train"],
+        "TweetQA": ["train"],
+        "WikiHow": ["train"],
+        "Xmarket": [],  # adopted from Cross-Market Recommendation (XMRec).
+        "S2ORC": [],  # title abstract pair.
+        "YahooAnswers": [],  # question answer pair.
+        "MSMARCO": ["train"],  # pairs and mined hard negative.
+        "StackExchange": [],  # title body pair.
+        "QuoraQA": ["train"],  # duplicate question pairs.
+        "MsCocoCaptions": ["train"],  # pairs describe the same image.
+        "Flickr30k": ["train"],  # pairs describe the same image.
+        "SNLI": ["train"],  # random negative.
+        "ESCI": ["train"],  # exact match as positive match and mined hard negative.
+        "NegationDataset": [
+            "train"
+        ],  # synthetically generated negation dataset https://huggingface.co/datasets/jinaai/negation-dataset
+        "NQ": ["train"],  # mined hard negative.
+        "HotpotQA": ["train"],  # mined hard negative.
+        "FEVER": ["train"],  # mined hard negative.
+        "CC-NEWS": [],  # title content with random negative.
+    },
+    public_training_code=None,
+    public_training_data=None,
+)
+
+jina_embedding_b_en_v1 = ModelMeta(
+    loader=partial(
+        SentenceTransformerWrapper,
+        model_name="jinaai/jina-embedding-b-en-v1",
+        revision="32aa658e5ceb90793454d22a57d8e3a14e699516",
+    ),
+    name="jinaai/jina-embedding-b-en-v1",
+    languages=["eng-Latn"],
+    open_weights=True,
+    revision="32aa658e5ceb90793454d22a57d8e3a14e699516",
+    release_date="2023-07-07",
+    n_parameters=110_000_000,
+    memory_usage_mb=420,
+    embed_dim=768,
+    license="apache-2.0",
+    max_tokens=512,
+    reference="https://huggingface.co/jinaai/jina-embedding-b-en-v1",
+    similarity_fn_name="cosine",
+    framework=["Sentence Transformers", "PyTorch"],
+    use_instructions=False,
+    superseded_by="jinaai/jina-embeddings-v2-base-en",
+    adapted_from="google-t5/t5-base",
+    training_datasets={
+        "PAQ": ["train"],
+        "GooAQ": ["train"],
+        "WikiAnswers": ["train"],
+        "AmazonQA": ["train"],
+        "ELI5": ["train"],
+        "SentenceCompression": ["train"],
+        "SimpleWikipedia": ["train"],
+        "Specter": ["train"],
+        "Squad2": ["train"],
+        "Tmdb": ["train"],
+        "TrivialQA": ["train"],
+        "TweetQA": ["train"],
+        "WikiHow": ["train"],
+        "Xmarket": [],  # adopted from Cross-Market Recommendation (XMRec).
+        "S2ORC": [],  # title abstract pair.
+        "YahooAnswers": [],  # question answer pair.
+        "MSMARCO": ["train"],  # pairs and mined hard negative.
+        "StackExchange": [],  # title body pair.
+        "QuoraQA": ["train"],  # duplicate question pairs.
+        "MsCocoCaptions": ["train"],  # pairs describe the same image.
+        "Flickr30k": ["train"],  # pairs describe the same image.
+        "SNLI": ["train"],  # random negative.
+        "ESCI": ["train"],  # exact match as positive match and mined hard negative.
+        "NegationDataset": [
+            "train"
+        ],  # synthetically generated negation dataset https://huggingface.co/datasets/jinaai/negation-dataset
+    },
+    public_training_code=None,
+    public_training_data=None,
+)
+
+jina_embedding_s_en_v1 = ModelMeta(
+    loader=partial(
+        SentenceTransformerWrapper,
+        model_name="jinaai/jina-embedding-s-en-v1",
+        revision="5ac6cd473e2324c6d5f9e558a6a9f65abb57143e",
+    ),
+    name="jinaai/jina-embedding-s-en-v1",
+    languages=["eng-Latn"],
+    open_weights=True,
+    revision="5ac6cd473e2324c6d5f9e558a6a9f65abb57143e",
+    release_date="2023-07-07",
+    n_parameters=35_000_000,
+    memory_usage_mb=134,
+    embed_dim=512,
+    license="apache-2.0",
+    max_tokens=512,
+    reference="https://huggingface.co/jinaai/jina-embedding-s-en-v1",
+    similarity_fn_name="cosine",
+    framework=["Sentence Transformers", "PyTorch"],
+    use_instructions=False,
+    superseded_by="jinaai/jina-embeddings-v2-small-en",
+    adapted_from="google-t5/t5-small",
+    training_datasets={
+        "PAQ": ["train"],
+        "GooAQ": ["train"],
+        "WikiAnswers": ["train"],
+        "AmazonQA": ["train"],
+        "ELI5": ["train"],
+        "SentenceCompression": ["train"],
+        "SimpleWikipedia": ["train"],
+        "Specter": ["train"],
+        "Squad2": ["train"],
+        "Tmdb": ["train"],
+        "TrivialQA": ["train"],
+        "TweetQA": ["train"],
+        "WikiHow": ["train"],
+        "Xmarket": [],  # adopted from Cross-Market Recommendation (XMRec).
+        "S2ORC": [],  # title abstract pair.
+        "YahooAnswers": [],  # question answer pair.
+        "MSMARCO": ["train"],  # pairs and mined hard negative.
+        "StackExchange": [],  # title body pair.
+        "QuoraQA": ["train"],  # duplicate question pairs.
+        "MsCocoCaptions": ["train"],  # pairs describe the same image.
+        "Flickr30k": ["train"],  # pairs describe the same image.
+        "SNLI": ["train"],  # random negative.
+        "ESCI": ["train"],  # exact match as positive match and mined hard negative.
+        "NegationDataset": [
+            "train"
+        ],  # synthetically generated negation dataset https://huggingface.co/datasets/jinaai/negation-dataset
+    },
+    public_training_code=None,
+    public_training_data=None,
+)
