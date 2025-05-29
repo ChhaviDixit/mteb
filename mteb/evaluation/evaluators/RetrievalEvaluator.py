@@ -21,7 +21,7 @@ from .Evaluator import Evaluator
 from .utils import (
     confidence_scores,
     convert_conv_history_to_query,
-    cos_sim,
+    # cos_sim,
     download,
     js_div,
     hole,

@@ -35,41 +35,33 @@ def tensor_transform(x):
 
 
 def js_div(a, b):
-    """
-    Compute Jensen-Shannon divergence between probability distributions.
-
-    Args:
-        a (Tensor): Batch of distributions shape [B, D]
-        b (Tensor): Batch of distributions shape [C, D]
-
-    Returns:
-        Tensor: JS divergence scores shape [B, C]
-    """
-    if not isinstance(a, torch.Tensor):
-        a = torch.tensor(a)
-
-    if not isinstance(b, torch.Tensor):
-        b = torch.tensor(b)
-
-    # for scaling and normalization of input
-    a = tensor_transform(a)
-    b = tensor_transform(b)
+    a = tensor_transform(torch.as_tensor(a))
+    b = tensor_transform(torch.as_tensor(b))
     
-    # Expand for broadcast and pairwise calculation between each query and doc
-    a = a.unsqueeze(1)  # [B, 1, D]
-    b = b.unsqueeze(0)  # [1, C, D]
-    
+    a = a.unsqueeze(1)
     eps=1e-5
     a = torch.clamp(a, min=eps, max=1.0-eps)
-    b = torch.clamp(b, min=eps, max=1.0-eps)
-    m = 0.5 * (a + b) + eps
-    # log2 to keep values within range [0, 1]
-    kl_am = torch.sum(a * torch.log2(a / m), dim=-1)
-    kl_bm = torch.sum(b * torch.log2(b / m), dim=-1)
     
-    # Compute JS divergence and convert to similarity to match scale of standard similarities
-    js_similarity = 1.0 - 0.5 * (kl_am + kl_bm)
+    batch_size_a = a.size(0)
+    batch_size_b = b.size(0)
     
+    # Chunk size - adjusted based on available memory
+    chunk_size = 256  
+    
+    js_similarity = torch.zeros((batch_size_a, batch_size_b), device=a.device)
+    
+    for i in range(0, batch_size_b, chunk_size):
+        b_chunk = b[i:i + chunk_size]
+        b_chunk = b_chunk.unsqueeze(0)
+        b_chunk = torch.clamp(b_chunk, min=eps, max=1.0-eps)
+        
+        m = 0.5 * (a + b_chunk) + eps
+        
+        kl_am = torch.sum(a * torch.log2(a / m), dim=-1)
+        kl_bm = torch.sum(b_chunk * torch.log2(b_chunk / m), dim=-1)
+        
+        js_similarity[:, i:i + chunk_size] = 1.0 - 0.5 * (kl_am + kl_bm)
+        
     return js_similarity
 
 def cos_sim(a, b):
